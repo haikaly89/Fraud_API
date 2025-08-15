@@ -1,57 +1,55 @@
 from fastapi import FastAPI
-import pickle
-import pandas as pd
-import numpy as np
 from pydantic import BaseModel
+import pandas as pd #type: ignore
+import numpy as np # Import numpy
+import pickle
+import tensorflow as tf #type: ignore
+import uvicorn
 
-with open("model/train_Model.pkl", "rb") as f:
-    model = pickle.load(f)
+try:
+    model = tf.keras.models.load_model("model/fraud_model_tf.h5")
+    with open("model/scaler.pkl", "rb") as f:
+        scaler = pickle.load(f)
+    with open("model/model_columns.pkl", "rb") as f:
+        model_columns = pickle.load(f)
+    print("Model dan aset berhasil dimuat.")
+except Exception as e:
+    print(f"Error saat memuat aset: {e}")
+    exit()
 
-with open("model/model_columns.pkl", "rb") as f:
-    model_columns = pickle.load(f)
+app = FastAPI(title="Fraud Detection API")
 
-class InputData(BaseModel):
+class TransactionData(BaseModel):
     amount: float
-    merchant: str
+    merchant_type: str  
     device_type: str
 
-app = FastAPI(title="Fraud Detection API - Low Risk Tuning")
-
-@app.get("/")
-def read_root():
-    return {"message": "Fraud Detection API (Low Risk Tuning) is running"}
-
 @app.post("/predict")
-def predict(data: InputData):
+def predict(data: TransactionData):
+    input_df = pd.DataFrame([data.dict()])
 
-    sample_df = pd.DataFrame([data.dict()])
+    input_df['amount_log'] = np.log1p(input_df['amount'])
 
-    sample_df["amount_log"] = np.log1p(sample_df["amount"])
+    input_encoded = pd.get_dummies(input_df, columns=['merchant_type', 'device_type'])
+    
+    input_encoded = input_encoded.drop(columns=['amount'], errors='ignore')
 
-    combined = pd.DataFrame(columns=["merchant", "device_type"])
-    combined = pd.concat([combined, sample_df[["merchant", "device_type"]]], ignore_index=True)
+    final_df = input_encoded.reindex(columns=model_columns, fill_value=0)
 
-    combined_encoded = pd.get_dummies(combined, drop_first=True)
+    input_scaled = scaler.transform(final_df)
 
-    sample_encoded = combined_encoded.iloc[[-1]].reset_index(drop=True)
-
-    numerical_cols = ["amount_log"]
-    sample_final = pd.concat([sample_df[numerical_cols].reset_index(drop=True), sample_encoded], axis=1)
-
-    for col in model_columns:
-        if col not in sample_final.columns:
-            sample_final[col] = 0
-
-    sample_final = sample_final[model_columns]
-
-    prediction = model.predict(sample_final)
-    proba = model.predict_proba(sample_final)
+    prob_fraud = model.predict(input_scaled)[0][0]
+    prob_nonfraud = 1 - prob_fraud
+    label = "Fraud" if prob_fraud >= 0.5 else "Non-Fraud"
 
     return {
-        "prediction": int(prediction[0]),
-        "label": "Fraud" if prediction[0] == 1 else "Non-Fraud",
+        "prediction": int(prob_fraud >= 0.5),
+        "label": label,
         "probability": {
-            "Non-Fraud": float(proba[0][0]),
-            "Fraud": float(proba[0][1])
+            "Non-Fraud": float(prob_nonfraud),
+            "Fraud": float(prob_fraud)
         }
     }
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
